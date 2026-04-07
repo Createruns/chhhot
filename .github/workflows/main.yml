@@ -1,0 +1,189 @@
+name: macOS RDP Remote Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_duration:
+        description: "Session duration in minutes (min: 20, max: 360)"
+        required: true
+        default: "60"
+        type: choice
+        options:
+          - "20"
+          - "30"
+          - "60"
+          - "90"
+          - "120"
+          - "180"
+          - "240"
+          - "342"
+          - "36000"
+
+jobs:
+  macos-rdp:
+    runs-on: macos-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.session_duration || '60') }}
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: "Session Configuration for macOS Latest"
+        run: |
+          echo "MACOS LATEST RDP SESSION"
+          echo "=================================================="
+          echo "Runner: macos-latest"
+          echo "OS: macOS $(sw_vers -productVersion)"
+          echo "Hardware: GitHub macOS Runner"
+          echo "=================================================="
+          echo ""
+
+      - name: "Enable Screen Sharing (VNC/RDP) and Configure User"
+        run: |
+          set +e
+          echo "Configuring macOS remote access..."
+
+          # Create admin user
+          sudo sysadminctl -addUser gg -fullName "GG User" -password root -admin
+
+          # Install and run TurboVNC which works on GitHub runners
+          brew install --quiet turbovnc 2>/dev/null || true
+          if [ -f /opt/TurboVNC/bin/vncserver ]; then
+            /opt/TurboVNC/bin/vncserver :1 -geometry 1920x1080 -depth 24 -password root || true
+            echo "✅ TurboVNC server started on display :1 port 5901"
+          fi
+
+          # Enable SSH
+          sudo systemsetup -setremotelogin on
+
+          # Set root password
+          sudo dscl . -passwd /Users/root root 2>/dev/null
+          echo "root:root" | sudo chpasswd 2>/dev/null
+
+          echo "✅ macOS remote access configured!"
+          echo "✅ Username: gg"
+          echo "✅ Password: root"
+          echo "✅ Root password: root"
+          exit 0
+
+      - name: "Display Connection Information"
+        run: |
+          echo ""
+          echo "MACOS RDP / VNC ACCESS READY"
+          echo "=================================================="
+          echo "Runner: macos-latest"
+          echo "OS: macOS $(sw_vers -productVersion)"
+          echo ""
+          echo "🔗 Connection Details:"
+          echo "   VNC / Screen Sharing Access is now configured"
+          echo "   Username: gg"
+          echo "   Password: root"
+          echo ""
+          echo "📋 Connection Instructions:"
+          echo "1. VNC Connection:"
+          echo "   - Use any VNC client or macOS Screen Sharing"
+          echo "   - Connect to the public tunnel address"
+          echo "   - Login with username: gg, password: root"
+          echo ""
+          echo "2. SSH Connection:"
+          echo "   - Use: ssh gg@<runner-ip>"
+          echo "   - Password: root"
+          echo ""
+          echo "=================================================="
+          echo ""
+
+          # Show network info
+          echo "Network Information:"
+          ifconfig | grep -E 'inet ' | grep -v '127.0.0.1' || echo "Network info not available"
+          echo ""
+
+      - name: "Setup TMATE Remote SSH Access"
+        run: |
+          echo "Setting up TMATE for SSH access..."
+          echo ""
+
+          # Install tmate
+          brew install --quiet tmate 2>/dev/null || true
+          if ! command -v tmate &> /dev/null; then
+            # Manual install if brew fails
+            curl -L https://github.com/tmate-io/tmate/releases/download/2.4.0/tmate-2.4.0-macosx-x86_64.tar.gz -o tmate.tar.gz
+            tar xzf tmate.tar.gz
+            sudo mv tmate-*/tmate /usr/local/bin/
+            rm -rf tmate*
+          fi
+
+          # Generate API key and start tmate
+          tmate -S /tmp/tmate.sock new-session -d
+          tmate -S /tmp/tmate.sock wait tmate-ready
+
+          echo ""
+          echo "✅ TMATE SSH ACCESS READY"
+          echo "=================================================="
+          echo "SSH Connection:"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_ssh}'
+          echo ""
+          echo "SSH (Read-only):"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_ssh_ro}'
+          echo ""
+          echo "Web Connection:"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_web}'
+          echo ""
+          echo "Web (Read-only):"
+          tmate -S /tmp/tmate.sock display -p '#{tmate_web_ro}'
+          echo "=================================================="
+          echo ""
+          echo "Session will remain active for duration of workflow"
+          echo "Connect using one of the SSH commands above"
+          echo ""
+
+          # Keep session alive
+          while true; do
+            sleep 60
+            echo "Session still active at: $(date)"
+          done
+
+      - name: "Prepare Downloads Folder for Upload"
+        if: always()
+        run: |
+          echo "=================================================="
+          echo "📦 PREPARING ARTIFACT UPLOAD"
+          echo "=================================================="
+
+          mkdir -p "$GITHUB_WORKSPACE/artifact-downloads"
+
+          # Copy user downloads
+          if [ -d "/Users/gg/Downloads" ]; then
+            echo "📂 Copying from /Users/gg/Downloads/ ..."
+            cp -r "/Users/gg/Downloads/." "$GITHUB_WORKSPACE/artifact-downloads/" 2>/dev/null && \
+              echo "✅ User Downloads copied successfully" || \
+              echo "⚠️  Downloads folder is empty"
+          fi
+
+          if [ -d "/Users/runner/Downloads" ]; then
+            echo "📂 Copying from /Users/runner/Downloads/ ..."
+            cp -r "/Users/runner/Downloads/." "$GITHUB_WORKSPACE/artifact-downloads/" 2>/dev/null && \
+              echo "✅ Runner Downloads copied successfully" || \
+              echo "⚠️  Runner Downloads folder is empty"
+          fi
+
+          # Summary
+          echo ""
+          echo "📋 Files ready for upload:"
+          echo "=================================================="
+          find "$GITHUB_WORKSPACE/artifact-downloads/" -type f | while read f; do
+            echo "  📄 $f ($(du -sh "$f" | cut -f1))"
+          done
+          TOTAL=$(du -sh "$GITHUB_WORKSPACE/artifact-downloads/" 2>/dev/null | cut -f1)
+          echo "--------------------------------------------------"
+          echo "  📦 Total size: ${TOTAL:-0}"
+          echo "=================================================="
+
+      - name: "Upload Downloads as Artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-downloads-backup-${{ github.run_id }}
+          path: artifact-downloads/
+          retention-days: 90
+          if-no-files-found: warn
+          
