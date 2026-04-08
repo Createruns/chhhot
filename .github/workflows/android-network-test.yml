@@ -12,29 +12,26 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install ngrok
+      - name: Install cloudflared
         run: |
-          brew install ngrok
+          brew install cloudflared
 
       - name: Start local HTTP server
         run: |
           python -m http.server 8080 --bind 127.0.0.1 &
           sleep 3
 
-      - name: Create SSH tunnel (serveo)
+      - name: Create Cloudflare Tunnel
         run: |
-          ssh -o StrictHostKeyChecking=no -R 80:localhost:8080 serveo.net &
-          sleep 10
+          cloudflared tunnel --url http://127.0.0.1:8080 &
+          sleep 15
 
       - name: Get tunnel URL
         run: |
-          curl -s serveo.net
-
-      - name: Test connectivity
-        run: |
-          curl -v http://127.0.0.1:8080
+          curl -s localhost:9090/tunnel
+        id: tunnel-url
 
       - name: Report status
         run: |
-          echo "Network test completed successfully"
-          echo "Tunnel ready - Android can connect via SSH tunnel"
+          echo "Network test completed"
+          echo "Tunnel URL: ${{ steps.tunnel-url.outputs.tunnel }}"
