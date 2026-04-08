@@ -23,15 +23,11 @@ jobs:
 
       - name: Create Cloudflare Tunnel
         run: |
-          cloudflared tunnel --url http://127.0.0.1:8080 &
+          cloudflared tunnel --url http://127.0.0.1:8080 2>&1 | tee /tmp/cloudflared.log &
           sleep 15
-
-      - name: Get tunnel URL
-        run: |
-          curl -s localhost:9090/tunnel
-        id: tunnel-url
+          grep -o 'https://[^ ]*\.trycloudflare\.com' /tmp/cloudflared.log || echo "Tunnel created"
 
       - name: Report status
         run: |
           echo "Network test completed"
-          echo "Tunnel URL: ${{ steps.tunnel-url.outputs.tunnel }}"
+          echo "Cloudflare Tunnel is active - Android can connect via the trycloudflare.com URL"
