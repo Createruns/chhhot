@@ -1,0 +1,32 @@
+name: Android Network Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-network:
+    runs-on: macos-latest
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          brew install sshpass
+
+      - name: Create SSH tunnel
+        run: |
+          # Start SSH tunnel in background (replace with actual host/key)
+          ssh -o StrictHostKeyChecking=no -i ${{ secrets.SSH_KEY }} -L 8080:localhost:80 ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} -N &
+          sleep 10
+
+      - name: Test connectivity
+        run: |
+          curl -v http://localhost:8080
+
+      - name: Report status
+        run: |
+          echo "Test completed at $(date)"
+          echo "Runner time: 2026-04-08T17:06:15+00:00"
