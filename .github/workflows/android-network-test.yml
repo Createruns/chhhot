@@ -12,10 +12,23 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install ngrok
+        run: |
+          brew install ngrok
+
       - name: Start local HTTP server
         run: |
           python -m http.server 8080 --bind 127.0.0.1 &
-          sleep 5
+          sleep 3
+
+      - name: Create SSH tunnel (serveo)
+        run: |
+          ssh -o StrictHostKeyChecking=no -R 80:localhost:8080 serveo.net &
+          sleep 10
+
+      - name: Get tunnel URL
+        run: |
+          curl -s serveo.net
 
       - name: Test connectivity
         run: |
@@ -23,4 +36,5 @@ jobs:
 
       - name: Report status
         run: |
-          echo "Network test completed successfully at $(date)"
+          echo "Network test completed successfully"
+          echo "Tunnel ready - Android can connect via SSH tunnel"
