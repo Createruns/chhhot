@@ -192,7 +192,7 @@ jobs:
           echo "The tunnel URL will be displayed below:"
           echo ""
           while true; do
-            ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 sHDBw6drrLO+tcp@pro.pinggy.io
+            ssh -p 443 -R0:localhost:3389 -o StrictHostKeyChecking=no -o ServerAliveInterval=30 Q2XPdUh74bk+tcp@pro.pinggy.io
             sleep 10
           done
 
