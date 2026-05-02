@@ -7,7 +7,7 @@ on:
       session_duration:
         description: "Session duration in minutes (min: 20, max: 360)"
         required: true
-        default: "60"
+        default: "345"
         type: choice
         options:
           - "20"
@@ -31,43 +31,47 @@ jobs:
       contents: read
 
     steps:
-      - name: "Session Configuration for Ubuntu Latest"
-        run: |
-          echo "UBUNTU LATEST RDP SESSION"
-          echo "=================================================="
-          echo "Runner: ubuntu-latest-l"
-          echo "OS: Ubuntu Latest"
-          echo "Group: Default"
-          echo "Hardware: Enterprise GitHub Runner"
-          echo "=================================================="
-          echo ""
-
       - name: "Install XFCE4 Desktop and RDP Server"
         run: |
           echo "Installing XFCE4 desktop environment and xRDP..."
 
-          # Update package list
-          sudo apt update && sudo apt upgrade -y
+          # Retry function with exponential backoff
+          apt_retry() {
+            local n=0
+            local max_retry=5
+            local delay=30
+            while true; do
+              if sudo apt "$@"; then
+                return 0
+              fi
+              n=$((n+1))
+              if [ $n -ge $max_retry ]; then
+                echo "Max retries reached"
+                return 1
+              fi
+              echo "Retrying in $((delay * 2 ** (n-1)))s..."
+              sleep $((delay * 2 ** (n-1)))
+            done
+          }
 
-          # Install XFCE4 desktop environment with required X11 and D-Bus packages
-          # dbus-x11: Provides dbus-launch required for desktop environment
-          # x11-xserver-utils: Provides X11 utilities for better compatibility
-          sudo apt install xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils -y
+          # Fix broken packages
+          sudo apt --fix-broken install -y || true
+          sudo apt clean || true
 
-          # Install Firefox browser (firefox-esr is not available on Ubuntu)
-          sudo apt install -y firefox || sudo snap install firefox
+          # Update and install
+          apt_retry update || exit 1
+          apt_retry install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils || exit 1
 
-          # Start D-Bus service (required for desktop environment communication)
+          # Firefox with fallback
+          sudo apt install -y firefox || sudo snap install firefox || echo "Firefox skipped"
+
+          # Start services
           sudo service dbus start
-
-          # Configure XFCE4 for RDP
           echo "startxfce4" > ~/.xsession
           sudo chown $(whoami):$(whoami) ~/.xsession
-
-          # Start xrdp service (using service command for compatibility)
           sudo service xrdp start
 
-          echo "✅ XFCE4 and xRDP installation completed!"
+          echo "✅ Installation completed!"
 
       - name: "Create User and Configure Access"
         run: |
