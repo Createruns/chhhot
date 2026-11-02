@@ -48,7 +48,7 @@ jobs:
             "autologin-user-timeout=0" \
             "autologin-session=xfce" \
             "user-session=xfce" \
-            | sudo tee /etc/lightdm/lightdm.conf.d/50-anydesk.conf >/dev/null'
+            | sudo tee /etc/lightdm/lightdm.conf >/dev/null'
 
           printf '%s\n' \
             'Section "Device"' \
@@ -77,39 +77,43 @@ jobs:
 
           sudo systemctl disable gdm3 2>/dev/null || true
           sudo systemctl enable lightdm
-          cat /etc/lightdm/lightdm.conf.d/50-anydesk.conf
+          cat /etc/lightdm/lightdm.conf
           ls /usr/share/xsessions/
 
-      - name: "Start X11 seat session (LightDM autologin)"
+      - name: "Start X11 desktop session (LightDM autologin)"
         run: |
           set -e
-          sudo systemctl start lightdm
-          X11_OK=no
-          for i in $(seq 1 60); do
+          sudo systemctl start lightdm || true
+          SESSION_OK=no
+          for i in $(seq 1 90); do
             for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}') ; do
               T=$(loginctl show-session "$s" -p Type --value 2>/dev/null || true)
-              if [ "$T" = "x11" ]; then X11_OK=yes; break 2; fi
+              C=$(loginctl show-session "$s" -p Class --value 2>/dev/null || true)
+              ST=$(loginctl show-session "$s" -p State --value 2>/dev/null || true)
+              if [ "$T" = "x11" ] && [ "$C" = "user" ] && [ "$ST" = "active" ]; then SESSION_OK=yes; break 2; fi
             done
             sleep 5
           done
-          echo "X11 seat session detected: $X11_OK"
+          echo "Logged-in X11 user session detected: $SESSION_OK"
           pgrep -a Xorg || true
-          loginctl list-sessions --no-legend || true
+          pgrep -a lightdm || true
           for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}') ; do
-            echo "session $s: Type=$(loginctl show-session "$s" -p Type --value 2>/dev/null) State=$(loginctl show-session "$s" -p State --value 2>/dev/null)"
+            echo "session $s: Type=$(loginctl show-session "$s" -p Type --value 2>/dev/null) Class=$(loginctl show-session "$s" -p Class --value 2>/dev/null) State=$(loginctl show-session "$s" -p State --value 2>/dev/null)"
           done
-          if [ "$X11_OK" != "yes" ]; then
-            echo "::error::No X11 session on seat0 - AnyDesk incoming will fail"
-            sudo journalctl -u lightdm --no-pager | tail -60 || true
-            sudo journalctl -b --no-pager | grep -i Xorg | tail -30 || true
+          if [ "$SESSION_OK" != "yes" ]; then
+            echo "::error::No active XFCE user session on X11 (autologin failed?)"
+            sudo journalctl -u lightdm --no-pager | tail -80 || true
+            sudo journalctl -b --no-pager | grep -iE "Xorg|lightdm|pam" | tail -40 || true
             exit 1
           fi
+          sleep 20
 
       - name: "Start AnyDesk as root, set password, show ID"
         env:
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
           set -e
+          sudo -iu "$(id -nu 1000)" pulseaudio --start 2>/dev/null || true
           sudo systemctl restart anydesk
           sleep 3
           ANYDESK_ID=""
@@ -119,12 +123,15 @@ jobs:
           done
           printf '%s\n' "$ANYDESK_PASSWORD" | sudo anydesk --set-password
           sleep 3
+          STATUS=$(sudo anydesk --get-status 2>/dev/null || echo unknown)
+          echo "AnyDesk network status: $STATUS"
           {
             echo "### AnyDesk ID: $ANYDESK_ID"
             echo ""
+            echo "- Network status: $STATUS"
             echo "- Unattended password: from secret \`ANYDESK_PASSWORD\` (set at repository level)"
-            echo "- X11 session: LightDM autologin (XFCE), required for incoming AnyDesk sessions"
-            echo "- Connect from AnyDesk client using the ID above."
+            echo "- Display: LightDM autologin XFCE session on X11 (required for incoming AnyDesk sessions)"
+            echo "- Wait ~30s for the XFCE desktop to finish loading before connecting."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::AnyDesk ID = $ANYDESK_ID (password set from ANYDESK_PASSWORD secret)"
 
@@ -132,5 +139,7 @@ jobs:
         run: |
           while true; do
             date +"%Y-%m-%d %H:%M:%S - session active"
+            pgrep Xorg >/dev/null || sudo systemctl restart lightdm || true
+            pgrep -x anydesk >/dev/null || sudo systemctl restart anydesk || true
             sleep 60
           done
