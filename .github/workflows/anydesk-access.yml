@@ -139,7 +139,16 @@ jobs:
         run: |
           while true; do
             date +"%Y-%m-%d %H:%M:%S - session active"
+            echo "anydesk status: $(sudo anydesk --get-status 2>/dev/null || echo unknown)"
+            sudo grep -oE '^ad\.anynet\.(pwd_hash|pwd_salt)' /etc/anydesk/service.conf 2>/dev/null | sed 's/^/password-key: /' || echo "password-key: MISSING in /etc/anydesk/service.conf"
             pgrep Xorg >/dev/null || sudo systemctl restart lightdm || true
             pgrep -x anydesk >/dev/null || sudo systemctl restart anydesk || true
+            echo "--- anydesk service logs ---"
+            sudo find /var/log/anydesk -type f -name "*.log" -o -type f -name "*trace*" 2>/dev/null | while read -r f; do
+              echo ">> $f"
+              sudo tail -n 40 "$f" 2>/dev/null
+            done
+            sudo journalctl -u anydesk --no-pager -n 15 || true
+            echo "--- end anydesk logs ---"
             sleep 60
           done
