@@ -38,9 +38,10 @@ jobs:
         run: |
           set -e
           echo "shared/default-x-display-manager select lightdm" | sudo debconf-set-selections
-          sudo apt-get install -y xfce4 xfce4-terminal lightdm lightdm-gtk-greeter xserver-xorg-video-dummy >/dev/null
+          sudo apt-get install -y xfce4 xfce4-terminal lightdm lightdm-gtk-greeter xserver-xorg-video-dummy pipewire pipewire-pulse wireplumber pulseaudio-utils >/dev/null
           RUNNER_USER=$(id -nu 1000)
           echo "Runner desktop user: $RUNNER_USER"
+          sudo loginctl enable-linger "$RUNNER_USER"
 
           RUNNER_USER="$RUNNER_USER" bash -c 'printf "%s\n" \
             "[Seat:*]" \
@@ -106,6 +107,15 @@ jobs:
             sudo journalctl -b --no-pager | grep -iE "Xorg|lightdm|pam" | tail -40 || true
             exit 1
           fi
+          sudo -u "$RUNNER_USER" env XDG_RUNTIME_DIR=/run/user/$(id -u "$RUNNER_USER") systemctl --user restart pipewire pipewire-pulse wireplumber 2>/dev/null || true
+          sleep 5
+          PACTL_OUT=$(sudo -u "$RUNNER_USER" env XDG_RUNTIME_DIR=/run/user/$(id -u "$RUNNER_USER") pactl info 2>&1 | head -4 || true)
+          echo "Audio server check (pactl info):"
+          echo "$PACTL_OUT"
+          case "$PACTL_OUT" in
+            *Server\ Name*|*PipeWire*|*PulseAudio*) echo "::notice::Audio server is up (prevents the pa_context assertion crash)";;
+            *) echo "::warning::Audio server not reachable - AnyDesk session may abort with desk_rt_ipc_error";;
+          esac
           sleep 20
 
       - name: "Start AnyDesk as root, set password, show ID"
@@ -113,7 +123,6 @@ jobs:
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
           set -e
-          sudo -iu "$(id -nu 1000)" pulseaudio --start 2>/dev/null || true
           sudo systemctl restart anydesk
           sleep 3
           ANYDESK_ID=""
