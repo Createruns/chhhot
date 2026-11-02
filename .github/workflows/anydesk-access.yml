@@ -1,0 +1,82 @@
+name: AnyDesk Remote Access
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_duration:
+        description: "Session duration in minutes (max: 360)"
+        required: true
+        default: "345"
+        type: choice
+        options:
+          - "20"
+          - "30"
+          - "60"
+          - "120"
+          - "180"
+          - "300"
+          - "345"
+          - "360"
+
+jobs:
+  anydesk-session:
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(github.event.inputs.session_duration || '345') }}
+    permissions:
+      contents: read
+
+    steps:
+      - name: "Install AnyDesk"
+        run: |
+          set -e
+          wget -qO- https://keys.anydesk.com/repos/DEB-GPG-KEY | sudo tee /etc/apt/trusted.gpg.d/anydesk.asc >/dev/null
+          echo "deb http://deb.anydesk.com/ all main" | sudo tee /etc/apt/sources.list.d/anydesk.list
+          sudo apt-get update -qq
+          sudo apt-get install -y anydesk
+
+      - name: "Install lightweight desktop session"
+        run: |
+          set -e
+          sudo apt-get install -y xfce4 xfce4-terminal xorg dbus-x11 x11-xserver-utils xvfb >/dev/null
+          printf '%s\n' \
+            '[Unit]' \
+            'Description=Xvfb server' \
+            'After=network.target' \
+            '' \
+            '[Service]' \
+            'ExecStart=/usr/bin/Xvfb :0 -screen 0 1920x1080x24' \
+            'Restart=always' \
+            'User=root' \
+            '' \
+            '[Install]' \
+            'WantedBy=multi-user.target' | sudo tee /etc/systemd/system/xvfb.service >/dev/null
+          sudo systemctl daemon-reload
+          sudo systemctl enable --now xvfb
+          sleep 2
+          sudo -E env DISPLAY=:0 dbus-run-session -- xfce4-session >/dev/null 2>&1 &
+          sleep 10
+
+      - name: "Start AnyDesk as root, set password, show ID"
+        env:
+          ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
+        run: |
+          set -e
+          sudo systemctl enable --now anydesk
+          sleep 3
+          ANYDESK_ID=$(sudo anydesk --get-id)
+          printf '%s\n' "$ANYDESK_PASSWORD" | sudo anydesk --set-password
+          sleep 3
+          {
+            echo "### AnyDesk ID: $ANYDESK_ID"
+            echo ""
+            echo "- Unattended password: from secret \`ANYDESK_PASSWORD\` (set at repository level)"
+            echo "- Connect from AnyDesk client using the ID above."
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice::AnyDesk ID = $ANYDESK_ID (password set from ANYDESK_PASSWORD secret)"
+
+      - name: "Keep session alive"
+        run: |
+          while true; do
+            date +"%Y-%m-%d %H:%M:%S - session active"
+            sleep 60
+          done
