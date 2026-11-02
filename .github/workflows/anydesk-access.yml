@@ -34,42 +34,96 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y anydesk
 
-      - name: "Install lightweight desktop session"
+      - name: "Install XFCE + LightDM + virtual display driver"
         run: |
           set -e
-          sudo apt-get install -y xfce4 xfce4-terminal xorg dbus-x11 x11-xserver-utils xvfb >/dev/null
+          echo "shared/default-x-display-manager select lightdm" | sudo debconf-set-selections
+          sudo apt-get install -y xfce4 xfce4-terminal lightdm lightdm-gtk-greeter xserver-xorg-video-dummy >/dev/null
+          RUNNER_USER=$(id -nu 1000)
+          echo "Runner desktop user: $RUNNER_USER"
+
+          RUNNER_USER="$RUNNER_USER" bash -c 'printf "%s\n" \
+            "[Seat:*]" \
+            "autologin-user=${RUNNER_USER}" \
+            "autologin-user-timeout=0" \
+            "autologin-session=xfce" \
+            "user-session=xfce" \
+            | sudo tee /etc/lightdm/lightdm.conf.d/50-anydesk.conf >/dev/null'
+
           printf '%s\n' \
-            '[Unit]' \
-            'Description=Xvfb server' \
-            'After=network.target' \
+            'Section "Device"' \
+            '    Identifier  "DummyDevice"' \
+            '    Driver      "dummy"' \
+            '    VideoRam    256000' \
+            'EndSection' \
             '' \
-            '[Service]' \
-            'ExecStart=/usr/bin/Xvfb :0 -screen 0 1920x1080x24' \
-            'Restart=always' \
-            'User=root' \
+            'Section "Monitor"' \
+            '    Identifier  "DummyMonitor"' \
+            '    HorizSync   31.5-48.5' \
+            '    VertRefresh 50-70' \
+            '    Modeline "1920x1080_60.00" 173.00 1920 2048 2248 2576 1080 1083 1088 1120 +hsync +vsync' \
+            'EndSection' \
             '' \
-            '[Install]' \
-            'WantedBy=multi-user.target' | sudo tee /etc/systemd/system/xvfb.service >/dev/null
-          sudo systemctl daemon-reload
-          sudo systemctl enable --now xvfb
-          sleep 2
-          sudo -E env DISPLAY=:0 dbus-run-session -- xfce4-session >/dev/null 2>&1 &
-          sleep 10
+            'Section "Screen"' \
+            '    Identifier  "DummyScreen"' \
+            '    Device      "DummyDevice"' \
+            '    Monitor     "DummyMonitor"' \
+            '    DefaultDepth 24' \
+            '    SubSection "Display"' \
+            '        Depth 24' \
+            '        Modes "1920x1080_60.00"' \
+            '    EndSubSection' \
+            'EndSection' | sudo tee /etc/X11/xorg.conf.d/10-dummy.conf >/dev/null
+
+          sudo systemctl disable gdm3 2>/dev/null || true
+          sudo systemctl enable lightdm
+          cat /etc/lightdm/lightdm.conf.d/50-anydesk.conf
+          ls /usr/share/xsessions/
+
+      - name: "Start X11 seat session (LightDM autologin)"
+        run: |
+          set -e
+          sudo systemctl start lightdm
+          X11_OK=no
+          for i in $(seq 1 60); do
+            for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}') ; do
+              T=$(loginctl show-session "$s" -p Type --value 2>/dev/null || true)
+              if [ "$T" = "x11" ]; then X11_OK=yes; break 2; fi
+            done
+            sleep 5
+          done
+          echo "X11 seat session detected: $X11_OK"
+          pgrep -a Xorg || true
+          loginctl list-sessions --no-legend || true
+          for s in $(loginctl list-sessions --no-legend 2>/dev/null | awk '{print $1}') ; do
+            echo "session $s: Type=$(loginctl show-session "$s" -p Type --value 2>/dev/null) State=$(loginctl show-session "$s" -p State --value 2>/dev/null)"
+          done
+          if [ "$X11_OK" != "yes" ]; then
+            echo "::error::No X11 session on seat0 - AnyDesk incoming will fail"
+            sudo journalctl -u lightdm --no-pager | tail -60 || true
+            sudo journalctl -b --no-pager | grep -i Xorg | tail -30 || true
+            exit 1
+          fi
 
       - name: "Start AnyDesk as root, set password, show ID"
         env:
           ANYDESK_PASSWORD: ${{ secrets.ANYDESK_PASSWORD }}
         run: |
           set -e
-          sudo systemctl enable --now anydesk
+          sudo systemctl restart anydesk
           sleep 3
-          ANYDESK_ID=$(sudo anydesk --get-id)
+          ANYDESK_ID=""
+          for i in $(seq 1 30); do
+            ANYDESK_ID=$(sudo anydesk --get-id || true)
+            case "$ANYDESK_ID" in ""|"0") sleep 2;; *) break;; esac
+          done
           printf '%s\n' "$ANYDESK_PASSWORD" | sudo anydesk --set-password
           sleep 3
           {
             echo "### AnyDesk ID: $ANYDESK_ID"
             echo ""
             echo "- Unattended password: from secret \`ANYDESK_PASSWORD\` (set at repository level)"
+            echo "- X11 session: LightDM autologin (XFCE), required for incoming AnyDesk sessions"
             echo "- Connect from AnyDesk client using the ID above."
           } >> "$GITHUB_STEP_SUMMARY"
           echo "::notice::AnyDesk ID = $ANYDESK_ID (password set from ANYDESK_PASSWORD secret)"
