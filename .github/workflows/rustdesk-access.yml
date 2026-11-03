@@ -136,54 +136,111 @@ jobs:
           fi
           sleep 3
 
-      - name: "Set unattended password and show ID"
+      - name: "Start desktop RustDesk server and set unattended password"
         env:
           CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
         run: |
-          set -e
+          set -euo pipefail
+
+          RUNNER_USER="$(id -nu 1000)"
+          RUNNER_UID="$(id -u 1000)"
+          echo "Desktop user: $RUNNER_USER ($RUNNER_UID)"
+
+          # The root service spawns `rustdesk --server` as the logged-in desktop user.
+          # That child owns the ID and the permanent password, so wait for it before touching the CLI.
+          sudo systemctl enable rustdesk >/dev/null 2>&1 || true
           sudo systemctl restart rustdesk || sudo systemctl start rustdesk
+
+          user_server_up() {
+            pgrep -u "$RUNNER_UID" -f 'rustdesk --server' >/dev/null 2>&1
+          }
+          wait_user_server() {
+            local i
+            for i in $(seq 1 90); do
+              if user_server_up; then echo "desktop --server process detected after ${i}s"; return 0; fi
+              sleep 1
+            done
+            return 1
+          }
+
+          if ! wait_user_server; then
+            echo "::warning::Service did not spawn the desktop server within 90s — launching it manually"
+            SES_PID="$(pgrep -u "$RUNNER_UID" -x xfce4-session | head -1 || true)"
+            DISPLAY_VAL=":0"
+            XAUTH_VAL=""
+            if [ -n "${SES_PID:-}" ]; then
+              DISPLAY_VAL="$(tr '\0' '\n' < "/proc/$SES_PID/environ" | sed -n 's/^DISPLAY=//p' | head -1 || true)"
+              XAUTH_VAL="$(tr '\0' '\n' < "/proc/$SES_PID/environ" | sed -n 's/^XAUTHORITY=//p' | head -1 || true)"
+            fi
+            DISPLAY_VAL="${DISPLAY_VAL:-:0}"
+            nohup sudo -u "$RUNNER_USER" env DISPLAY="$DISPLAY_VAL" \
+              XDG_RUNTIME_DIR="/run/user/$RUNNER_UID" ${XAUTH_VAL:+XAUTHORITY=$XAUTH_VAL} \
+              /usr/bin/rustdesk --server >/tmp/rustdesk-user-server.log 2>&1 &
+            if ! wait_user_server; then
+              echo "::error::Desktop RustDesk server never started"
+              tail -60 /tmp/rustdesk-user-server.log || true
+              exit 1
+            fi
+          fi
           sleep 3
+          pgrep -a -u "$RUNNER_UID" -f rustdesk || true
+          ls -la "/tmp/rustdesk-$RUNNER_UID/" 2>/dev/null || true
+
+          # ID now comes from the desktop instance (the one clients actually reach)
           RUSTDESK_ID=""
           for i in $(seq 1 30); do
             RUSTDESK_ID=$(sudo rustdesk --get-id 2>/dev/null || true)
             case "$RUSTDESK_ID" in ""|"0") sleep 2;; *) break;; esac
           done
 
-          # --- Password method: manual input if provided, otherwise random per-run ---
-          if [ -n "$CUSTOM_PASSWORD" ]; then
+          # Password: manual input when provided, otherwise random per run
+          if [ -n "${CUSTOM_PASSWORD:-}" ]; then
             RUSTDESK_PASSWORD="$CUSTOM_PASSWORD"
             PASS_SOURCE="manual input (custom_password)"
           else
-            RUSTDESK_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+            RUSTDESK_PASSWORD="$(openssl rand -hex 8)"
             PASS_SOURCE="random (auto-generated for this run only)"
           fi
-          case "$RUSTDESK_PASSWORD" in
-            '') echo "::error::Password could not be generated"; exit 1;;
-            *[!A-Za-z0-9]*) echo "::warning::Password contains non-alphanumeric characters — usually fine, keep it if you typed it on purpose";;
-          esac
-          echo "::add-mask::$RUSTDESK_PASSWORD" 2>/dev/null || true
+          [ -n "$RUSTDESK_PASSWORD" ] || { echo "::error::Password generation failed"; exit 1; }
 
-          sudo rustdesk --password "$RUSTDESK_PASSWORD"
-          sudo systemctl restart rustdesk
-          sleep 3
-          SYSTEM_STATUS=$(systemctl is-active rustdesk || true)
-          echo "rustdesk service: $SYSTEM_STATUS"
-          echo "Password source: $PASS_SOURCE"
+          # Apply and REQUIRE the CLI success ACK. No ::add-mask:: — masking also hides the
+          # password inside the run summary, which is the whole point of printing it there.
+          PASS_OUT=""
+          for attempt in 1 2 3; do
+            PASS_OUT=$(sudo rustdesk --password "$RUSTDESK_PASSWORD" 2>&1 || true)
+            echo "rustdesk --password attempt $attempt: ${PASS_OUT:-<no output>}"
+            case "$PASS_OUT" in *Done!*) break;; esac
+            sleep 5
+          done
+          case "$PASS_OUT" in
+            *Done!*) echo "Permanent password ACCEPTED by RustDesk (ACK received)";;
+            *) echo "::error::rustdesk --password failed: ${PASS_OUT:-<no output>}"; exit 1;;
+          esac
+
+          # Prove the hash was persisted in the desktop user's config
+          if sudo grep -qiE '^[[:space:]]*password[[:space:]]*=' /home/"$RUNNER_USER"/.config/rustdesk/*.toml 2>/dev/null; then
+            echo "Permanent password hash present in /home/$RUNNER_USER/.config/rustdesk/"
+          else
+            echo "::warning::password key not found in the desktop user's config after set"
+            sudo grep -nE '^(password|salt)[[:space:]]*=' /home/"$RUNNER_USER"/.config/rustdesk/*.toml 2>/dev/null || true
+          fi
+
           {
             echo "### RustDesk ID: $RUSTDESK_ID"
             echo ""
-            echo "- Service status: $SYSTEM_STATUS"
             echo "- Unattended password: \`$RUSTDESK_PASSWORD\` ($PASS_SOURCE)"
+            echo "- Apply check: ${PASS_OUT:-<no output>}"
             echo "- Get the free client from https://rustdesk.com/download, enter the ID above and the password."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::RustDesk ID = $RUSTDESK_ID — password ($PASS_SOURCE) is in the run summary"
+          # Annotation carries ID+password so it can also be read from the REST API (live).
+          echo "::notice title=RustDesk::ID=$RUSTDESK_ID PASSWORD=$RUSTDESK_PASSWORD SOURCE=$PASS_SOURCE"
 
       - name: "Keep session alive"
         run: |
           while true; do
             date +"%Y-%m-%d %H:%M:%S - session active"
             pgrep Xorg >/dev/null || sudo systemctl restart lightdm || true
-            pgrep -f "rustdesk --service" >/dev/null || sudo systemctl restart rustdesk || true
-            echo "rustdesk service: $(systemctl is-active rustdesk 2>/dev/null || true)"
+            pgrep -u 1000 -f 'rustdesk --server' >/dev/null || sudo systemctl restart rustdesk || true
+            echo "rustdesk desktop server: $(pgrep -u 1000 -f 'rustdesk --server' >/dev/null && echo up || echo down)"
             sleep 60
           done
