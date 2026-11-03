@@ -28,7 +28,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: ${{ fromJSON(github.event.inputs.session_duration || '345') }}
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: "Install XFCE + LightDM + virtual display driver"
@@ -137,6 +137,7 @@ jobs:
           sleep 3
 
       - name: "Start desktop RustDesk server and set unattended password"
+        id: rustdesk
         env:
           CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
         run: |
@@ -273,6 +274,43 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           # Annotation carries ID+password so it can also be read from the REST API (live).
           echo "::notice title=RustDesk::ID=$RUSTDESK_ID PASSWORD=$RUSTDESK_PASSWORD SOURCE=$PASS_SOURCE VERIFIED=$VERIFIED"
+
+          {
+            echo "id=$RUSTDESK_ID"
+            echo "password=$RUSTDESK_PASSWORD"
+            echo "source=$PASS_SOURCE"
+            echo "method=$PASS_METHOD"
+            echo "verified=$VERIFIED"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: "Publish credentials to session-info branch"
+        env:
+          GH_TOKEN: ${{ github.token }}
+          S_ID: ${{ steps.rustdesk.outputs.id }}
+          S_PASSWORD: ${{ steps.rustdesk.outputs.password }}
+          S_SOURCE: ${{ steps.rustdesk.outputs.source }}
+          S_METHOD: ${{ steps.rustdesk.outputs.method }}
+          S_VERIFIED: ${{ steps.rustdesk.outputs.verified }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/session-info && cd /tmp/session-info
+          git init -q .
+          {
+            echo "# RustDesk session credentials"
+            echo ""
+            echo "- **ID:** ${S_ID:-unknown}"
+            echo "- **Password:** \`${S_PASSWORD}\`"
+            echo "- Password source: ${S_SOURCE}"
+            echo "- Applied via: ${S_METHOD}"
+            echo "- Storage verified: ${S_VERIFIED}"
+            echo "- Updated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo ""
+            echo "Password is valid only while this run is active."
+          } > info.md
+          git add info.md
+          git -c user.name=rustdesk-bot -c user.email=rustdesk-bot@users.noreply.github.com commit -qm "session info"
+          git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/session-info \
+            || echo "::warning::could not publish session-info branch"
 
       - name: "Keep session alive"
         run: |
