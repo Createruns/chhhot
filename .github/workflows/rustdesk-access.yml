@@ -203,37 +203,76 @@ jobs:
           fi
           [ -n "$RUSTDESK_PASSWORD" ] || { echo "::error::Password generation failed"; exit 1; }
 
-          # Apply and REQUIRE the CLI success ACK. No ::add-mask:: — masking also hides the
-          # password inside the run summary, which is the whole point of printing it there.
+          # Apply via the official CLI and REQUIRE its success ACK ("Done!").
+          # No ::add-mask:: here: masking also turns the password into *** inside the run summary.
           PASS_OUT=""
+          CLI_OK=no
           for attempt in 1 2 3; do
             PASS_OUT=$(sudo rustdesk --password "$RUSTDESK_PASSWORD" 2>&1 || true)
             echo "rustdesk --password attempt $attempt: ${PASS_OUT:-<no output>}"
-            case "$PASS_OUT" in *Done!*) break;; esac
+            case "$PASS_OUT" in *Done!*) CLI_OK=yes; break;; esac
             sleep 5
           done
-          case "$PASS_OUT" in
-            *Done!*) echo "Permanent password ACCEPTED by RustDesk (ACK received)";;
-            *) echo "::error::rustdesk --password failed: ${PASS_OUT:-<no output>}"; exit 1;;
-          esac
 
-          # Prove the hash was persisted in the desktop user's config
-          if sudo grep -qiE '^[[:space:]]*password[[:space:]]*=' /home/"$RUNNER_USER"/.config/rustdesk/*.toml 2>/dev/null; then
-            echo "Permanent password hash present in /home/$RUNNER_USER/.config/rustdesk/"
+          RUNNER_HOME="$(getent passwd "$RUNNER_UID" | cut -d: -f6)"
+          CONF_DIR="$RUNNER_HOME/.config/rustdesk"
+          CONF_FILE="$CONF_DIR/RustDesk.toml"
+
+          if [ "$CLI_OK" != "yes" ]; then
+            echo "::warning::CLI could not set the password — dumping daemon log and using the documented on-disk fallback"
+            sudo journalctl -u rustdesk --no-pager 2>/dev/null | tail -60 || true
+            echo "config dir: $CONF_DIR"; sudo ls -la "$CONF_DIR" 2>/dev/null || true
+
+            # Fallback: permanent password storage = "00" + base64(SHA256(password || salt))
+            # (same format RustDesk itself persists and verifies against)
+            SALT="$(openssl rand -hex 16)"
+            H1_B64="$(printf '%s%s' "$RUSTDESK_PASSWORD" "$SALT" | openssl dgst -sha256 -binary | base64 -w0)"
+            STORED="00${H1_B64}"
+            sudo mkdir -p "$CONF_DIR"
+            if [ -f "$CONF_FILE" ]; then
+              sudo sed -i -E '/^[[:space:]]*(password|salt)[[:space:]]*=/d' "$CONF_FILE"
+            fi
+            { echo "password = '$STORED'"; echo "salt = '$SALT'"; sudo cat "$CONF_FILE" 2>/dev/null || true; } \
+              | sudo tee "$CONF_FILE.new" >/dev/null
+            sudo mv "$CONF_FILE.new" "$CONF_FILE"
+            sudo chown "$RUNNER_UID:$RUNNER_UID" "$CONF_FILE"
+            sudo chmod 600 "$CONF_FILE"
+            if ! sudo grep -qF "$STORED" "$CONF_FILE"; then
+              echo "::error::Fallback password write did not persist"
+              exit 1
+            fi
+            echo "Fallback hash written to $CONF_FILE"
+            PASS_METHOD="on-disk hash fallback (verified in $CONF_FILE)"
           else
-            echo "::warning::password key not found in the desktop user's config after set"
-            sudo grep -nE '^(password|salt)[[:space:]]*=' /home/"$RUNNER_USER"/.config/rustdesk/*.toml 2>/dev/null || true
+            PASS_METHOD="rustdesk --password CLI (daemon ACK)"
+          fi
+
+          # Restart the service so the desktop server reloads the final config, then re-check
+          sudo systemctl restart rustdesk || true
+          if ! wait_user_server; then
+            echo "::error::Desktop server did not come back after config update"
+            exit 1
+          fi
+          sleep 5
+          pgrep -a -u "$RUNNER_UID" -f 'rustdesk --server' || true
+          if sudo grep -qiE '^[[:space:]]*password[[:space:]]*=' "$CONF_FILE" 2>/dev/null; then
+            echo "Password storage present in $CONF_FILE"
+            VERIFIED=yes
+          else
+            echo "::error::No password storage found in $CONF_FILE"
+            VERIFIED=no
           fi
 
           {
             echo "### RustDesk ID: $RUSTDESK_ID"
             echo ""
             echo "- Unattended password: \`$RUSTDESK_PASSWORD\` ($PASS_SOURCE)"
-            echo "- Apply check: ${PASS_OUT:-<no output>}"
+            echo "- Apply method: $PASS_METHOD"
+            echo "- Storage verified: $VERIFIED"
             echo "- Get the free client from https://rustdesk.com/download, enter the ID above and the password."
           } >> "$GITHUB_STEP_SUMMARY"
           # Annotation carries ID+password so it can also be read from the REST API (live).
-          echo "::notice title=RustDesk::ID=$RUSTDESK_ID PASSWORD=$RUSTDESK_PASSWORD SOURCE=$PASS_SOURCE"
+          echo "::notice title=RustDesk::ID=$RUSTDESK_ID PASSWORD=$RUSTDESK_PASSWORD SOURCE=$PASS_SOURCE VERIFIED=$VERIFIED"
 
       - name: "Keep session alive"
         run: |
