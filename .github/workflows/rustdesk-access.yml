@@ -17,6 +17,11 @@ on:
           - "300"
           - "345"
           - "360"
+      custom_password:
+        description: "Manual RustDesk password (leave empty to auto-generate a random one)"
+        required: false
+        default: ""
+        type: string
 
 jobs:
   rustdesk-session:
@@ -133,7 +138,7 @@ jobs:
 
       - name: "Set unattended password and show ID"
         env:
-          RUSTDESK_PASSWORD: ${{ secrets.RUSTDESK_PASSWORD }}
+          CUSTOM_PASSWORD: ${{ github.event.inputs.custom_password }}
         run: |
           set -e
           sudo systemctl restart rustdesk || sudo systemctl start rustdesk
@@ -143,19 +148,35 @@ jobs:
             RUSTDESK_ID=$(sudo rustdesk --get-id 2>/dev/null || true)
             case "$RUSTDESK_ID" in ""|"0") sleep 2;; *) break;; esac
           done
+
+          # --- Password method: manual input if provided, otherwise random per-run ---
+          if [ -n "$CUSTOM_PASSWORD" ]; then
+            RUSTDESK_PASSWORD="$CUSTOM_PASSWORD"
+            PASS_SOURCE="manual input (custom_password)"
+          else
+            RUSTDESK_PASSWORD=$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16)
+            PASS_SOURCE="random (auto-generated for this run only)"
+          fi
+          case "$RUSTDESK_PASSWORD" in
+            '') echo "::error::Password could not be generated"; exit 1;;
+            *[!A-Za-z0-9]*) echo "::warning::Password contains non-alphanumeric characters — usually fine, keep it if you typed it on purpose";;
+          esac
+          echo "::add-mask::$RUSTDESK_PASSWORD" 2>/dev/null || true
+
           sudo rustdesk --password "$RUSTDESK_PASSWORD"
           sudo systemctl restart rustdesk
           sleep 3
           SYSTEM_STATUS=$(systemctl is-active rustdesk || true)
           echo "rustdesk service: $SYSTEM_STATUS"
+          echo "Password source: $PASS_SOURCE"
           {
             echo "### RustDesk ID: $RUSTDESK_ID"
             echo ""
             echo "- Service status: $SYSTEM_STATUS"
-            echo "- Unattended password: from secret \`RUSTDESK_PASSWORD\` (same value as previous password)"
+            echo "- Unattended password: \`$RUSTDESK_PASSWORD\` ($PASS_SOURCE)"
             echo "- Get the free client from https://rustdesk.com/download, enter the ID above and the password."
           } >> "$GITHUB_STEP_SUMMARY"
-          echo "::notice::RustDesk ID = $RUSTDESK_ID (password set from RUSTDESK_PASSWORD secret)"
+          echo "::notice::RustDesk ID = $RUSTDESK_ID — password ($PASS_SOURCE) is in the run summary"
 
       - name: "Keep session alive"
         run: |
