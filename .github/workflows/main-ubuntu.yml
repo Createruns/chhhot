@@ -93,6 +93,10 @@ jobs:
           sudo chown -R gg:gg /home/gg
           sudo chmod +x /home/gg/.xsession
 
+          # Root keeps its own session file for direct root RDP logins
+          echo "startxfce4" | sudo tee /root/.xsession >/dev/null
+          sudo chmod +x /root/.xsession
+
           # Suppress the polkit popup ("Authentication is required to create a color
           # managed device") that would otherwise interrupt the RDP desktop session.
           sudo tee /etc/polkit-1/rules.d/50-xrdp-colord.rules >/dev/null <<'POLKIT'
@@ -163,8 +167,8 @@ jobs:
           echo "   - Password: root"
           echo ""
           echo "🎥 FULL SESSION RECORDING is enabled — it starts automatically at run"
-          echo "   start (the always-on gg desktop on :0 is recorded even before you"
-          echo "   connect) and follows every RDP session you open."
+          echo "   start (always-on desktops on :0 and :1 record even before you"
+          echo "   connect) and follows EVERY user's RDP session (gg, root, runner...)."
           echo "   Live proof (refreshed every 5 min):"
           echo "   https://github.com/${GITHUB_REPOSITORY}/tree/rdp-session-info  (info.md + proof.png)"
           echo "   Recording clips are included in the downloads-backup artifact at session end."
@@ -192,78 +196,93 @@ jobs:
 
           # ────────────────────────────────────────────────────────────
           # 🎥 FULL SESSION RECORDING — live proof on branch rdp-session-info
-          # Recording starts automatically as soon as an RDP session appears
-          # (an Xorg display owned by gg), and the proof file + a fresh
-          # screenshot are pushed to rdp-session-info every 5 minutes.
+          # Recording starts at run begin (always-on desktops) and follows
+          # EVERY user's session — gg, root, runner, or any other X display.
+          # Proof file + fresh screenshot are pushed every 5 minutes.
           # ────────────────────────────────────────────────────────────
           RECDIR=/home/gg/.session-recording
           sudo mkdir -p "$RECDIR"
-          sudo chown gg:gg "$RECDIR"
-          GG_UID="$(id -u gg)"
+          sudo chmod 777 "$RECDIR"
 
-          # ── Always-on desktop for gg ─────────────────────────────────
-          # xRDP only creates a display when a client connects, so recording
-          # would have to wait. Instead gg gets an always-on XFCE desktop on
-          # virtual display :0 — the recorder grabs it immediately at run
-          # start. When you connect via RDP, xrdp's display (:10, :11, ...)
-          # is recorded as well; both run in parallel.
-          sudo mkdir -p /tmp/xdg-gg
-          sudo chown gg:gg /tmp/xdg-gg
-          sudo -u gg HOME=/home/gg XDG_RUNTIME_DIR=/tmp/xdg-gg \
-            /usr/bin/Xvfb :0 -screen 0 1600x900x24 -nolisten tcp >/tmp/xvfb-0.log 2>&1 &
-          XVFB_WAIT=0
-          while [ ! -S /tmp/.X11-unix/X0 ] && [ "$XVFB_WAIT" -lt 20 ]; do
-            sleep 1; XVFB_WAIT=$((XVFB_WAIT+1))
-          done
-          if [ -S /tmp/.X11-unix/X0 ]; then
-            sudo -u gg HOME=/home/gg DISPLAY=:0 XDG_RUNTIME_DIR=/tmp/xdg-gg \
-              dbus-run-session -- xfce4-session >/tmp/xfce-0.log 2>&1 &
-            echo "✅ Always-on desktop for gg is up on :0 — recording can start now"
-          else
-            echo "::warning::Always-on Xvfb desktop failed to start; recording begins with the first RDP login (see /tmp/xvfb-0.log)"
-          fi
+          display_user() { getent passwd "$(stat -c %u "/tmp/.X11-unix/X$1" 2>/dev/null)" 2>/dev/null | cut -d: -f1; }
+          display_home() { getent passwd "$(stat -c %u "/tmp/.X11-unix/X$1" 2>/dev/null)" 2>/dev/null | cut -d: -f6; }
 
-          find_gg_displays() {
-            # Returns every X display owned by gg (or run for gg): the always-on
-            # Xvfb :0 plus any current xrdp session display. Sorted & de-duplicated.
+          capture_run() {
+            # capture_run <display> <ffmpeg args...> — runs ffmpeg as that display's owner
+            local d="$1"; shift
+            local u h
+            u="$(display_user "$d")"
+            h="$(display_home "$d")"
+            if [ -z "$u" ] || [ -z "$h" ]; then
+              echo "warning: cannot resolve owner of display :$d" >&2
+              return 0
+            fi
+            if [ -f "$h/.Xauthority" ]; then
+              sudo -u "$u" HOME="$h" DISPLAY=":$d" XAUTHORITY="$h/.Xauthority" ffmpeg -nostdin "$@"
+            else
+              sudo -u "$u" HOME="$h" DISPLAY=":$d" ffmpeg -nostdin "$@"
+            fi
+          }
+
+          # ── Always-on desktops (recording exists from run start, no RDP needed)
+          start_desktop() {
+            local user="$1" disp="$2" home xdg w
+            home="$(getent passwd "$user" | cut -d: -f6)"
+            xdg="/tmp/xdg-$user"
+            sudo mkdir -p "$xdg"
+            sudo chown "$user:$user" "$xdg"
+            sudo -u "$user" HOME="$home" XDG_RUNTIME_DIR="$xdg" \
+              /usr/bin/Xvfb ":$disp" -screen 0 1600x900x24 -nolisten tcp >"/tmp/xvfb-$disp.log" 2>&1 &
+            w=0
+            while [ ! -S "/tmp/.X11-unix/X$disp" ] && [ "$w" -lt 20 ]; do
+              sleep 1; w=$((w+1))
+            done
+            if [ -S "/tmp/.X11-unix/X$disp" ]; then
+              sudo -u "$user" HOME="$home" DISPLAY=":$disp" XDG_RUNTIME_DIR="$xdg" \
+                dbus-run-session -- xfce4-session >"/tmp/xfce-$disp.log" 2>&1 &
+              echo "✅ Always-on desktop for $user is up on :$disp"
+            else
+              echo "::warning::Always-on desktop for $user failed on :$disp (see /tmp/xvfb-$disp.log)"
+            fi
+          }
+          start_desktop gg 0
+          start_desktop root 1
+
+          find_all_displays() {
+            # Every X display on the box, ANY owner: the always-on Xvfb desktops
+            # plus every xrdp session display once a user connects.
             {
               for sock in /tmp/.X11-unix/X*; do
                 [ -S "$sock" ] || continue
-                _d="${sock##*/X}"
-                _u="$(stat -c %u "$sock" 2>/dev/null || true)"
-                [ "$_u" = "$GG_UID" ] && echo "$_d"
+                echo "${sock##*/X}"
               done
-              # Fallback: xrdp Xorg processes whose Xauthority lives in gg's home
+              # Fallback: Xorg processes whose socket is not visible yet
               pgrep -a Xorg 2>/dev/null | while read -r line; do
-                _d=""; _auth=""
+                _d=""
                 for tok in $line; do
-                  if [ "$tok" = "-auth" ]; then _auth=next; continue; fi
-                  if [ "$_auth" = "next" ]; then _auth="$tok"; continue; fi
-                  case "$tok" in
-                    :[0-9]*) _d="$tok";;
-                  esac
+                  case "$tok" in :[0-9]*) _d="${tok#*:}";; esac
                 done
                 [ -n "$_d" ] || continue
-                _disp="${_d#*:}"; _disp="${_disp%%.*}"
-                case "${_auth:-}" in *gg*) echo "$_disp";; esac
+                _d="${_d%%.*}"
+                echo "$_d"
               done
-            } | sort -un
+            } | sort -n | uniq
           }
 
           publish_proof() {
             local tag="$1"
             local pub=/tmp/rdp-proof
             rm -rf "$pub"; mkdir -p "$pub"
-            local disp disps
-            disps="$(find_gg_displays | sed 's/^/:/' | paste -sd' ' -)"
-            disp="${disps%% *}"
+            local disps first
+            disps="$(find_all_displays | sed 's/^/:/' | paste -sd' ' -)"
+            first="$(find_all_displays | head -n 1)"
             {
               echo "# Ubuntu RDP session — recording proof"
               echo ""
               echo "- Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
               echo "- Proof refreshed (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
               if [ -n "$disps" ]; then
-                echo "- Recording: ON (displays: $disps)"
+                echo "- Recording: ON (displays: $disps — every user's session is recorded)"
               else
                 echo "- Recording: waiting for first display (starts automatically)"
               fi
@@ -277,10 +296,9 @@ jobs:
               echo ""
               echo "All clips are attached to the run's downloads-backup artifact when the session ends."
             } > "$pub/info.md"
-            if [ -n "$disp" ]; then
-              sudo -u gg HOME=/home/gg DISPLAY=":$disp" XAUTHORITY=/home/gg/.Xauthority \
-                ffmpeg -nostdin -y -hide_banner -loglevel error \
-                -f x11grab -framerate 2 -i ":$disp" -frames:v 1 /tmp/rdp-proof-shot.png 2>/dev/null || true
+            if [ -n "$first" ]; then
+              capture_run "$first" -y -hide_banner -loglevel error \
+                -f x11grab -framerate 2 -i ":$first" -frames:v 1 /tmp/rdp-proof-shot.png 2>/dev/null || true
               if [ -s /tmp/rdp-proof-shot.png ]; then
                 sudo chown "$(id -u):$(id -g)" /tmp/rdp-proof-shot.png 2>/dev/null || true
                 if [ "$(stat -c %s /tmp/rdp-proof-shot.png)" -gt 1024 ]; then
@@ -299,16 +317,15 @@ jobs:
             )
           }
 
-          # Recorder: one ffmpeg per gg display. The always-on :0 desktop gets
-          # recorded from run start (no RDP needed); whenever you connect via
-          # RDP, that session's display is picked up automatically too.
+          # Recorder: one ffmpeg per X display, whatever user it belongs to.
+          # Always-on desktops (:0 gg, :1 root) are recorded from run start;
+          # any RDP session opened by ANY user is picked up automatically.
           (
             while true; do
-              for d in $(find_gg_displays); do
+              for d in $(find_all_displays); do
                 if ! pgrep -a ffmpeg 2>/dev/null | grep -qE -- "-i :$d( |\$)"; then
-                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎥 Recording started on display :$d"
-                  sudo -u gg HOME=/home/gg DISPLAY=":$d" XAUTHORITY=/home/gg/.Xauthority \
-                    ffmpeg -nostdin -hide_banner -loglevel error \
+                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎥 Recording :$d (user: $(display_user "$d"))"
+                  capture_run "$d" -hide_banner -loglevel error \
                     -f x11grab -framerate 10 -i ":$d" \
                     -c:v libx264 -preset ultrafast -crf 25 -pix_fmt yuv420p \
                     -f segment -segment_time 300 -reset_timestamps 1 -strftime 1 \
@@ -316,8 +333,8 @@ jobs:
                     >"$RECDIR/ffmpeg-$d.log" 2>&1 &
                 fi
               done
-              if [ -z "$(find_gg_displays)" ]; then
-                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ No gg display to record — waiting..."
+              if [ -z "$(find_all_displays)" ]; then
+                echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ No X display to record — waiting..."
               fi
               sleep 20
             done
