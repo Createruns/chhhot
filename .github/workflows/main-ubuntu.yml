@@ -69,24 +69,6 @@ jobs:
 
           # Start services
           sudo service dbus start
-          # xrdp executes the .xsession of the LOGGED-IN user (gg). A file written
-          # to the workflow user's home (~ = /home/runner) is ignored for RDP logins.
-          echo "startxfce4" | sudo tee /home/gg/.xsession >/dev/null
-          sudo chown gg:gg /home/gg/.xsession
-          sudo chmod +x /home/gg/.xsession
-
-          # Suppress the polkit popup ("Authentication is required to create a color
-          # managed device") that would otherwise interrupt the RDP desktop session.
-          sudo tee /etc/polkit-1/rules.d/50-xrdp-colord.rules >/dev/null <<'POLKIT'
-          polkit.addRule(function(action, subject) {
-            if (action.id.indexOf("org.freedesktop.color-manager.") === 0 ||
-                action.id.indexOf("org.freedesktop.timedatectl.") === 0 ||
-                action.id.indexOf("org.freedesktop.hostname1.") === 0) {
-              return polkit.Result.YES;
-            }
-          });
-          POLKIT
-
           sudo service xrdp start
 
           echo "✅ Installation completed!"
@@ -103,6 +85,25 @@ jobs:
 
           # Add user to sudo group
           sudo usermod -aG sudo gg
+
+          # xrdp executes the .xsession of the LOGGED-IN user (gg). A file written
+          # to the workflow user's home (~ = /home/runner) is ignored for RDP logins.
+          sudo mkdir -p /home/gg
+          echo "startxfce4" | sudo tee /home/gg/.xsession >/dev/null
+          sudo chown -R gg:gg /home/gg
+          sudo chmod +x /home/gg/.xsession
+
+          # Suppress the polkit popup ("Authentication is required to create a color
+          # managed device") that would otherwise interrupt the RDP desktop session.
+          sudo tee /etc/polkit-1/rules.d/50-xrdp-colord.rules >/dev/null <<'POLKIT'
+          polkit.addRule(function(action, subject) {
+            if (action.id.indexOf("org.freedesktop.color-manager.") === 0 ||
+                action.id.indexOf("org.freedesktop.timedatectl.") === 0 ||
+                action.id.indexOf("org.freedesktop.hostname1.") === 0) {
+              return polkit.Result.YES;
+            }
+          });
+          POLKIT
 
           # Set root password to 'root'
           echo "root:root" | sudo chpasswd
