@@ -24,7 +24,7 @@ jobs:
   ubuntu-rdp:
     # Pin a concrete image — ubuntu-latest currently rolls an Ubuntu 26.04
     # pre-release and its runner pool can stall in "queued" for long periods.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     # Customizable timeout: manual trigger uses chosen duration, schedule defaults to 60 min (max: 360 = 6 hours)
     timeout-minutes: ${{ fromJSON(github.event.inputs.session_duration || '60') }}
 
