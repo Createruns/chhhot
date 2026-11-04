@@ -26,9 +26,9 @@ jobs:
     # Customizable timeout: manual trigger uses chosen duration, schedule defaults to 60 min (max: 360 = 6 hours)
     timeout-minutes: ${{ fromJSON(github.event.inputs.session_duration || '60') }}
 
-    # Limit GITHUB_TOKEN permissions (best practice)
+    # Write access is needed only to publish the recording-proof branch
     permissions:
-      contents: read
+      contents: write
 
     steps:
       - name: "Install XFCE4 Desktop and RDP Server"
@@ -60,15 +60,31 @@ jobs:
 
           # Update and install
           apt_retry update || exit 1
-          apt_retry install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils || exit 1
+          apt_retry install -y xfce4 xfce4-goodies xrdp dbus-x11 x11-xserver-utils ffmpeg || exit 1
 
           # Firefox with fallback
           sudo apt install -y firefox || sudo snap install firefox || echo "Firefox skipped"
 
           # Start services
           sudo service dbus start
-          echo "startxfce4" > ~/.xsession
-          sudo chown $(whoami):$(whoami) ~/.xsession
+          # xrdp executes the .xsession of the LOGGED-IN user (gg). A file written
+          # to the workflow user's home (~ = /home/runner) is ignored for RDP logins.
+          echo "startxfce4" | sudo tee /home/gg/.xsession >/dev/null
+          sudo chown gg:gg /home/gg/.xsession
+          sudo chmod +x /home/gg/.xsession
+
+          # Suppress the polkit popup ("Authentication is required to create a color
+          # managed device") that would otherwise interrupt the RDP desktop session.
+          sudo tee /etc/polkit-1/rules.d/50-xrdp-colord.rules >/dev/null <<'POLKIT'
+          polkit.addRule(function(action, subject) {
+            if (action.id.indexOf("org.freedesktop.color-manager.") === 0 ||
+                action.id.indexOf("org.freedesktop.timedatectl.") === 0 ||
+                action.id.indexOf("org.freedesktop.hostname1.") === 0) {
+              return polkit.Result.YES;
+            }
+          });
+          POLKIT
+
           sudo service xrdp start
 
           echo "✅ Installation completed!"
@@ -143,6 +159,10 @@ jobs:
           echo "   - Use: ssh gg@<runner-ip>"
           echo "   - Password: root"
           echo ""
+          echo "🎥 FULL SESSION RECORDING is enabled — live proof (refreshed every 5 min):"
+          echo "   https://github.com/${GITHUB_REPOSITORY}/tree/rdp-session-info  (info.md + proof.png)"
+          echo "   Recording clips are included in the downloads-backup artifact at session end."
+          echo ""
           echo "⏳ Session will run until manually stopped"
           echo "=================================================="
           echo ""
@@ -153,6 +173,8 @@ jobs:
           echo ""
 
       - name: "Maintain Connection and Setup Pinggy Tunnel"
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           echo "Maintaining connection and setting up remote access..."
           echo "Session started at: $(date '+%Y-%m-%d %H:%M:%S')"
@@ -161,6 +183,112 @@ jobs:
           # Install openssh-client if not present
           sudo apt-get update
           sudo apt-get install -y openssh-client
+
+          # ────────────────────────────────────────────────────────────
+          # 🎥 FULL SESSION RECORDING — live proof on branch rdp-session-info
+          # Recording starts automatically as soon as an RDP session appears
+          # (an Xorg display owned by gg), and the proof file + a fresh
+          # screenshot are pushed to rdp-session-info every 5 minutes.
+          # ────────────────────────────────────────────────────────────
+          RECDIR=/home/gg/.session-recording
+          sudo mkdir -p "$RECDIR"
+          sudo chown gg:gg "$RECDIR"
+          GG_UID="$(id -u gg)"
+
+          find_active_display() {
+            local line tok d auth u disp
+            pgrep -a Xorg 2>/dev/null || true | while read -r line; do
+              d=""
+              auth=""
+              for tok in $line; do
+                if [ "$tok" = "-auth" ]; then auth=next; continue; fi
+                if [ "$auth" = "next" ]; then auth="$tok"; continue; fi
+                case "$tok" in
+                  :[0-9]*) d="$tok";;
+                esac
+              done
+              [ -n "$d" ] || continue
+              disp="${d#*:}"; disp="${disp%%.*}"
+              [ -S "/tmp/.X11-unix/X$disp" ] || continue
+              u="$(stat -c %u "/tmp/.X11-unix/X$disp" 2>/dev/null || true)"
+              # Trust either the socket owner (gg) or an Xauthority under gg's home
+              if [ "$u" = "$GG_UID" ] || [ "${auth#*gg}" != "$auth" ] || [ "${auth#*/home/gg}" != "$auth" ]; then
+                echo "$disp"
+                break
+              fi
+            done | head -n 1
+          }
+
+          publish_proof() {
+            local tag="$1"
+            local pub=/tmp/rdp-proof
+            rm -rf "$pub"; mkdir -p "$pub"
+            local disp
+            disp="$(find_active_display)"
+            {
+              echo "# Ubuntu RDP session — recording proof"
+              echo ""
+              echo "- Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+              echo "- Proof refreshed (UTC): $(date -u '+%Y-%m-%d %H:%M:%S')"
+              if [ -n "$disp" ]; then
+                echo "- Recording: ON (display :$disp)"
+              else
+                echo "- Recording: waiting for your first RDP login (starts automatically)"
+              fi
+              echo "- Recorder processes: $(pgrep -x ffmpeg | wc -l)"
+              echo ""
+              echo "## Clips (a new one every 5 minutes)"
+              echo ""
+              echo '```'
+              sudo ls -lh "$RECDIR" 2>/dev/null | awk '/sess_.*\.mp4/ {print $5, $9}'
+              echo '```'
+              echo ""
+              echo "All clips are attached to the run's downloads-backup artifact when the session ends."
+            } > "$pub/info.md"
+            if [ -n "$disp" ]; then
+              sudo -u gg HOME=/home/gg DISPLAY=":$disp" XAUTHORITY=/home/gg/.Xauthority \
+                ffmpeg -nostdin -y -hide_banner -loglevel error \
+                -f x11grab -framerate 2 -i ":$disp" -frames:v 1 /tmp/rdp-proof-shot.png 2>/dev/null || true
+              if [ -s /tmp/rdp-proof-shot.png ]; then
+                sudo chown "$(id -u):$(id -g)" /tmp/rdp-proof-shot.png 2>/dev/null || true
+                if [ "$(stat -c %s /tmp/rdp-proof-shot.png)" -gt 1024 ]; then
+                  cp /tmp/rdp-proof-shot.png "$pub/proof.png"
+                fi
+                sudo rm -f /tmp/rdp-proof-shot.png
+              fi
+            fi
+            (
+              cd "$pub"
+              git init -q .
+              git add -A
+              git -c user.name=rdp-bot -c user.email=rdp-bot@users.noreply.github.com commit -qm "recording proof ($tag)"
+              git push -qf "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:refs/heads/rdp-session-info \
+                || echo "::warning::could not publish recording proof to rdp-session-info"
+            )
+          }
+
+          # Recorder: grabs the gg RDP display; restarts on reconnects (new display)
+          (
+            while true; do
+              if ! pgrep -x ffmpeg >/dev/null 2>&1; then
+                disp="$(find_active_display)"
+                if [ -n "$disp" ]; then
+                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] 🎥 Recording started on display :$disp"
+                  sudo -u gg HOME=/home/gg DISPLAY=":$disp" XAUTHORITY=/home/gg/.Xauthority \
+                    ffmpeg -nostdin -hide_banner -loglevel error \
+                    -f x11grab -framerate 10 -i ":$disp" \
+                    -c:v libx264 -preset ultrafast -crf 25 -pix_fmt yuv420p \
+                    -f segment -segment_time 300 -reset_timestamps 1 -strftime 1 \
+                    "$RECDIR/sess_%Y%m%dT%H%M%SZ.mp4" \
+                    >"$RECDIR/ffmpeg.log" 2>&1 &
+                else
+                  echo "[$(date '+%Y-%m-%d %H:%M:%S')] ⏳ Waiting for an RDP session to record..."
+                fi
+              fi
+              sleep 20
+            done
+          ) &
+          publish_proof "initial"
 
           echo ""
           echo "SETTING UP PINGGY SSH TUNNEL FOR REMOTE ACCESS"
@@ -186,6 +314,9 @@ jobs:
                   sleep 5
               fi
 
+              publish_proof "periodic"
+
+              sudo ls -lh "$RECDIR"/sess_*.mp4 2>/dev/null | awk '{print "  clip:", $5, $9}' || true
               sleep 300  # 5 minutes between health checks
             done
           ) &
@@ -237,6 +368,16 @@ jobs:
               echo "✅ $HOME/Downloads/ copied successfully" || \
               echo "⚠️  $HOME/Downloads/ is empty"
           fi
+
+          # ── Third: RDP user gg's downloads ─────────────────────
+          sudo mkdir -p /home/gg/Downloads
+          sudo cp -r /home/gg/Downloads/. "$GITHUB_WORKSPACE/artifact-downloads/gg-Downloads/" 2>/dev/null && \
+            echo "✅ gg's Downloads copied" || echo "⚠️  gg's Downloads is empty"
+
+          # ── Fourth: full session recording clips ───────────────
+          sudo mkdir -p "$GITHUB_WORKSPACE/artifact-downloads/session-recording"
+          sudo cp -r /home/gg/.session-recording/. "$GITHUB_WORKSPACE/artifact-downloads/session-recording/" 2>/dev/null && \
+            echo "✅ Session recording copied" || echo "⚠️  No recording files yet"
 
           # ── Fix permissions on staged files ────────────────────
           sudo chown -R $(whoami):$(whoami) "$GITHUB_WORKSPACE/artifact-downloads/"
